@@ -1,0 +1,4 @@
+# Pinned upstream for office-android.yml. Bump deliberately; the ccache key includes the commit.
+url=https://gerrit.collaboraoffice.com/online
+branch=distro/collabora/co-26.04
+commit=df1cc805838b7a4991805e6c23774d79d67587d6

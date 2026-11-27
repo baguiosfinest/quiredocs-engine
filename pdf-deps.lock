@@ -1,0 +1,5 @@
+# Sourced by scripts/build-qpdf.sh; sha256 verified after download.
+QPDF_URL=https://github.com/qpdf/qpdf/archive/refs/tags/v12.4.2.tar.gz
+QPDF_SHA256=88ddeb5f25c6e9156f3113fc3994d3a5e0cdfeee398cd09dd00fabc9dac9f573
+JPEG_URL=https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.0.4/libjpeg-turbo-3.0.4.tar.gz
+JPEG_SHA256=99130559e7d62e8d695f2c0eaeef912c5828d5b84a0537dcb24c9678c9d5b76b

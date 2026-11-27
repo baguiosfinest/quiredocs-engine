@@ -1,0 +1,129 @@
+name: pdf
+
+on:
+  push:
+    tags: ['engine-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PDFIUM_TAG: chromium/8179
+  NDK_VERSION: 29.0.14206865
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a,   pdfium: pdfium-android-arm64 }
+          - { abi: armeabi-v7a, pdfium: pdfium-android-arm }
+          - { abi: x86_64,      pdfium: pdfium-android-x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build nasm pkg-config cmake
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" "ndk;$NDK_VERSION"
+      - name: PDFium (verified)
+        run: |
+          mkdir -p dl stage/${{ matrix.abi }}
+          curl -fsSL -o dl/${{ matrix.pdfium }}.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG/\//%2F}/${{ matrix.pdfium }}.tgz"
+          (cd dl && grep " ${{ matrix.pdfium }}.tgz\$" ../pdfium.lock | shasum -a 256 -c -)
+          tar xzf dl/${{ matrix.pdfium }}.tgz -C stage/${{ matrix.abi }} lib include licenses LICENSE VERSION
+      - name: qpdf + libjpeg-turbo
+        run: |
+          scripts/build-qpdf.sh stage/${{ matrix.abi }} \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-26
+      - name: Check contents
+        run: |
+          test -f stage/${{ matrix.abi }}/lib/libpdfium.so
+          test -f stage/${{ matrix.abi }}/lib/libqpdf.a
+          find stage -maxdepth 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-android-${{ matrix.abi }}
+          path: stage
+
+  ios:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { slice: ios-arm64,         pdfium: pdfium-ios-device-arm64,    sdk: iphoneos,        arch: arm64 }
+          - { slice: ios-sim-arm64,     pdfium: pdfium-ios-simulator-arm64, sdk: iphonesimulator, arch: arm64 }
+          - { slice: ios-sim-x86_64,    pdfium: pdfium-ios-simulator-x64,   sdk: iphonesimulator, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ninja pkgconf
+      - name: PDFium (verified)
+        run: |
+          mkdir -p dl stage/${{ matrix.slice }}
+          curl -fsSL -o dl/${{ matrix.pdfium }}.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG/\//%2F}/${{ matrix.pdfium }}.tgz"
+          (cd dl && grep " ${{ matrix.pdfium }}.tgz\$" ../pdfium.lock | shasum -a 256 -c -)
+          tar xzf dl/${{ matrix.pdfium }}.tgz -C stage/${{ matrix.slice }} lib include licenses LICENSE VERSION
+      - name: qpdf + libjpeg-turbo
+        # JPEG_EXTRA: SIMD off on iOS (x86_64 simulator would need nasm); zlib comes from the iOS SDK.
+        env:
+          JPEG_EXTRA: -DWITH_SIMD=0
+        run: |
+          scripts/build-qpdf.sh stage/${{ matrix.slice }} \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=${{ matrix.sdk }} \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_MACOSX_BUNDLE=OFF
+      - name: Check contents
+        run: |
+          test -f stage/${{ matrix.slice }}/lib/libpdfium.dylib
+          test -f stage/${{ matrix.slice }}/lib/libqpdf.a
+          lipo -info stage/${{ matrix.slice }}/lib/libqpdf.a
+          find stage -maxdepth 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-ios-${{ matrix.slice }}
+          path: stage
+
+  package:
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: stage-*
+          path: in
+      - name: Package
+        run: |
+          mkdir -p out
+          for p in android ios; do
+            mkdir -p "pkg/$p"
+            for d in in/stage-$p-*/*; do cp -a "$d" "pkg/$p/"; done
+            tar czf "out/quiredocs-pdf-$p.tgz" -C pkg "$p"
+          done
+          . ./pdf-deps.lock
+          qv=$(echo "$QPDF_URL" | sed 's|.*/v\([0-9.]*\)\.tar.*|\1|')
+          jv=$(echo "$JPEG_URL" | sed 's|.*/\([0-9.]*\)/libjpeg.*|\1|')
+          cat > out/licences.json <<JSON
+          [
+            {"name": "pdfium", "version": "$PDFIUM_TAG", "licence": "BSD-3-Clause", "note": "bundled third-party licences in licenses/ of each slice"},
+            {"name": "qpdf", "version": "$qv", "licence": "Apache-2.0", "note": "licenses/qpdf/"},
+            {"name": "libjpeg-turbo", "version": "$jv", "licence": "IJG AND BSD-3-Clause AND Zlib", "note": "licenses/libjpeg-turbo/"},
+            {"name": "zlib", "version": "toolchain (NDK / iOS SDK)", "licence": "Zlib"}
+          ]
+          JSON
+          python3 -m json.tool out/licences.json >/dev/null
+          cp pdfium.lock pdf-deps.lock out/
+          (cd out && sha256sum * > SHA256SUMS)
+          cat out/SHA256SUMS
+          for p in android ios; do echo "== $p"; tar tzf out/quiredocs-pdf-$p.tgz | grep -E 'libpdfium|libqpdf|qpdf.hh$' ; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quiredocs-pdf
+          path: out/*
