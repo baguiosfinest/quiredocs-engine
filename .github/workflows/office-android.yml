@@ -1,10 +1,6 @@
 name: office-android
 
 on:
-  # TEMPORARY (remove before merge): dispatch needs the file on main, so run from the PR branch on push
-  push:
-    branches: [m0/ci]
-    paths: ['.github/workflows/office-android.yml']
   workflow_dispatch:
     inputs:
       abi:
