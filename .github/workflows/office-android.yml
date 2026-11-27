@@ -1,0 +1,275 @@
+name: office-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: Target ABI (one engine configure per ABI)
+        type: choice
+        options: [arm64-v8a, x86_64]
+        default: arm64-v8a
+      chain_count:
+        description: Resume counter (0 for a fresh chain; the workflow increments it when re-dispatching itself)
+        type: string
+        default: '0'
+      chain_start:
+        description: Epoch seconds when the chain started (set automatically on re-dispatch)
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: office-android-${{ inputs.abi }}
+  cancel-in-progress: false
+
+env:
+  ABI: ${{ inputs.abi }}
+  CHAIN_COUNT: ${{ inputs.chain_count }}
+  NDK_VERSION: 29.0.14206865
+  MAX_CHAIN: 4
+  # make budget measured from job start: 6 h limit minus >= 30 min for cache save / re-dispatch
+  MAKE_DEADLINE_MIN: 325
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Job start time and chain guard
+        run: |
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+          echo "CHAIN_START=${{ inputs.chain_start }}" >> "$GITHUB_ENV"
+          if [ -z "${{ inputs.chain_start }}" ]; then echo "CHAIN_START=$(date +%s)" >> "$GITHUB_ENV"; fi
+          if [ "$CHAIN_COUNT" -ge "$MAX_CHAIN" ]; then
+            echo "::error::chain_count=$CHAIN_COUNT reached the maximum of $MAX_CHAIN runs"; exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Read upstream.lock
+        run: |
+          . ./upstream.lock
+          { echo "UP_URL=$url"; echo "UP_BRANCH=$branch"; echo "UP_COMMIT=$commit"; } >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/swift /usr/local/share/powershell /usr/local/julia* \
+            "$AGENT_TOOLSDIRECTORY/CodeQL" /opt/hostedtoolcache/CodeQL
+          # keep the Android SDK + cmdline-tools, drop preinstalled NDKs we do not use
+          sudo rm -rf "$ANDROID_HOME"/ndk/*
+          docker image prune --all --force >/dev/null || true
+          df -h /
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          echo "free GB: $avail"
+          if [ "$avail" -lt 40 ]; then echo "::error::only ${avail} GB free, need >= 40"; exit 1; fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config build-essential git ccache gperf nasm flex bison \
+            zip unzip xsltproc libxml2-utils python3 python3-dev python3-polib python3-lxml python3-setuptools \
+            ant perl m4 patch curl ca-certificates cmake ninja-build \
+            libfontconfig-dev libfreetype-dev libcups2-dev libx11-dev libxt-dev libxext-dev libxrender-dev \
+            libgl-dev libglu1-mesa-dev libkrb5-dev libnss3-dev libcap-dev libpam0g-dev libssl-dev
+
+      - name: Install Android NDK, build-tools and platform
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" "ndk;$NDK_VERSION" "build-tools;37.0.0" "platforms;android-37.0" "cmake;3.22.1"
+          ls "$ANDROID_HOME/ndk"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Fetch pinned upstream
+        run: |
+          mkdir online && cd online
+          git init -q
+          git remote add origin "$UP_URL"
+          if ! git fetch -q --depth 1 origin "$UP_COMMIT"; then
+            git fetch -q --depth 300 origin "refs/heads/$UP_BRANCH"
+          fi
+          git checkout -q "$UP_COMMIT"
+          git log -1 --oneline
+
+      - name: Apply patches
+        if: hashFiles('patches/*.patch') != ''
+        working-directory: online
+        run: |
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do echo "applying $p"; git apply --verbose "$p"; done
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.abi }}-${{ env.UP_COMMIT }}-${{ github.run_id }}
+          restore-keys: ccache-${{ inputs.abi }}-${{ env.UP_COMMIT }}-
+
+      - name: Restore external tarballs
+        id: extar
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/external-tar
+          key: external-tar-${{ env.UP_COMMIT }}
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.ccache ~/external-tar
+          {
+            echo "CCACHE_DIR=$HOME/.ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
+            echo "CCACHE_MAXSIZE=6G"
+          } >> "$GITHUB_ENV"
+          CCACHE_DIR=$HOME/.ccache ccache -z
+          echo "ccache restored: ${{ steps.ccache.outputs.cache-matched-key || 'none (cold)' }}"
+
+      - name: Configure engine
+        working-directory: online/engine
+        run: |
+          case "$ABI" in
+            arm64-v8a) DISTRO=CPAndroidAarch64 ;;
+            x86_64)    DISTRO=CPAndroidX86_64 ;;
+          esac
+          # release only: no --enable-dbgutil / --enable-debug / --enable-sal-log. Same flags for both ABIs.
+          # (--disable-branding is a top-level configure option, not an engine one.)
+          cat > autogen.input <<EOT
+          --with-android-ndk=$ANDROID_HOME/ndk/$NDK_VERSION
+          --with-android-sdk=$ANDROID_HOME
+          --with-distro=$DISTRO
+          --with-external-tar=$HOME/external-tar
+          EOT
+          cat autogen.input
+          ./autogen.sh
+
+      - name: Build engine (time-boxed)
+        id: make
+        working-directory: online/engine
+        run: |
+          budget=$(( JOB_START + MAKE_DEADLINE_MIN*60 - $(date +%s) ))
+          echo "make budget: $budget s"
+          set +e
+          timeout -s INT "$budget" make -j"$(nproc)" 2>&1 | tee "$RUNNER_TEMP/make.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "make rc=$rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Save ccache
+        id: save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.abi }}-${{ env.UP_COMMIT }}-${{ github.run_id }}
+
+      - name: Save external tarballs
+        if: always() && steps.extar.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/external-tar
+          key: external-tar-${{ env.UP_COMMIT }}
+
+      - name: Delete superseded ccache entries
+        if: always() && steps.save.outcome == 'success'
+        run: |
+          cur="ccache-$ABI-$UP_COMMIT-${{ github.run_id }}"
+          keys=$(gh cache list --key "ccache-$ABI-$UP_COMMIT-" --limit 100 --json id,key --jq '.[]|"\(.id) \(.key)"')
+          echo "$keys"
+          if echo "$keys" | grep -q " $cur\$"; then
+            echo "$keys" | awk -v c="$cur" '$2!=c{print $1}' | while read -r id; do gh cache delete "$id" || true; done
+          fi
+
+      - name: Chain summary and re-dispatch
+        if: always()
+        run: |
+          rc="${{ steps.make.outputs.rc }}"
+          now=$(date +%s)
+          {
+            echo "## office-android $ABI"
+            echo "- upstream commit: \`$UP_COMMIT\`"
+            echo "- run in chain: $((CHAIN_COUNT+1)) of max $MAX_CHAIN"
+            echo "- this run wall-clock: $(( (now-JOB_START)/60 )) min"
+            echo "- chain wall-clock so far: $(( (now-CHAIN_START)/60 )) min"
+            echo "- make exit code: ${rc:-n/a} (124 = time budget hit)"
+            echo '```'; ccache -s; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" = 124 ]; then
+            next=$((CHAIN_COUNT+1))
+            if [ "$next" -ge "$MAX_CHAIN" ]; then
+              echo "::error::engine make still unfinished after $MAX_CHAIN runs; chain guard hit"; exit 1
+            fi
+            gh workflow run office-android.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.ref_name }}" \
+              -f abi="$ABI" -f chain_count="$next" -f chain_start="$CHAIN_START"
+            echo "- re-dispatched as chain_count=$next" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail if make failed for a real reason
+        if: steps.make.outputs.rc != '0' && steps.make.outputs.rc != '124'
+        run: echo "::error::engine make failed (rc=${{ steps.make.outputs.rc }})"; tail -n 200 "$RUNNER_TEMP/make.log"; exit 1
+
+      # ---- everything below only runs when the engine make finished ----
+      - name: Configure Android app (top level)
+        if: steps.make.outputs.rc == '0'
+        working-directory: online
+        run: |
+          ./autogen.sh
+          ./configure --enable-androidapp --disable-branding
+
+      - name: Build browser assets and app glue (top level make)
+        if: steps.make.outputs.rc == '0'
+        working-directory: online
+        run: make -j"$(nproc)"
+
+      - name: Gradle build AAR (browser assets are built by the generate*Assets tasks)
+        if: steps.make.outputs.rc == '0'
+        working-directory: online/android
+        run: |
+          if [ "$ABI" = x86_64 ]; then task=:lib:assembleDebug; else task=:lib:assembleRelease; fi
+          ./gradlew --no-daemon "$task"
+
+      - name: Collect and checksum AAR
+        if: steps.make.outputs.rc == '0'
+        run: |
+          mkdir -p out && cd out
+          aar=$(find "$GITHUB_WORKSPACE/online" -name '*.aar' -path '*outputs/aar*' | head -1)
+          [ -n "$aar" ] || { echo "::error::no AAR produced"; exit 1; }
+          cp "$aar" "quiredocs-office-android-$ABI.aar"
+          cp "$GITHUB_WORKSPACE/upstream.lock" .
+          sha256sum ./* > SHA256SUMS
+          so_size=$(unzip -lv "quiredocs-office-android-$ABI.aar" | awk '/liblo-native-code.so/{print $1" bytes uncompressed, "$3" compressed"}')
+          {
+            echo "### AAR ($ABI)"
+            echo "- AAR size: $(du -h "quiredocs-office-android-$ABI.aar" | cut -f1) ($(stat -c %s "quiredocs-office-android-$ABI.aar") bytes)"
+            echo "- liblo-native-code.so: ${so_size:-not found in AAR}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload AAR
+        if: steps.make.outputs.rc == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quiredocs-office-android-${{ inputs.abi }}
+          path: out/*
+          if-no-files-found: error
