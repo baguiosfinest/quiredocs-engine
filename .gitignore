@@ -1,0 +1,5 @@
+build/
+out/
+*.aar
+*.xcframework
+*.zip
