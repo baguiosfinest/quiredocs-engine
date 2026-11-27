@@ -1,6 +1,8 @@
 name: pdf
 
 on:
+  push:
+    tags: ['engine-v*']
   workflow_dispatch:
 
 permissions:
@@ -105,11 +107,14 @@ jobs:
             for d in in/stage-$p-*/*; do cp -a "$d" "pkg/$p/"; done
             tar czf "out/quiredocs-pdf-$p.tgz" -C pkg "$p"
           done
-          cat > out/licences.json <<'JSON'
+          . ./pdf-deps.lock
+          qv=$(echo "$QPDF_URL" | sed 's|.*/v\([0-9.]*\)\.tar.*|\1|')
+          jv=$(echo "$JPEG_URL" | sed 's|.*/\([0-9.]*\)/libjpeg.*|\1|')
+          cat > out/licences.json <<JSON
           [
-            {"name": "pdfium", "version": "chromium/8179", "licence": "BSD-3-Clause", "note": "bundled third-party licences in licenses/ of each slice"},
-            {"name": "qpdf", "version": "12.4.2", "licence": "Apache-2.0"},
-            {"name": "libjpeg-turbo", "version": "3.0.4", "licence": "IJG AND BSD-3-Clause AND Zlib"},
+            {"name": "pdfium", "version": "$PDFIUM_TAG", "licence": "BSD-3-Clause", "note": "bundled third-party licences in licenses/ of each slice"},
+            {"name": "qpdf", "version": "$qv", "licence": "Apache-2.0", "note": "licenses/qpdf/"},
+            {"name": "libjpeg-turbo", "version": "$jv", "licence": "IJG AND BSD-3-Clause AND Zlib", "note": "licenses/libjpeg-turbo/"},
             {"name": "zlib", "version": "toolchain (NDK / iOS SDK)", "licence": "Zlib"}
           ]
           JSON

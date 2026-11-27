@@ -18,7 +18,7 @@ on:
         default: ''
 
 permissions:
-  contents: write
+  contents: read
   actions: write
 
 concurrency:
@@ -27,28 +27,35 @@ concurrency:
 
 env:
   ABI: ${{ inputs.abi || 'arm64-v8a' }}
-  CHAIN_COUNT: ${{ inputs.chain_count || '0' }}
+  IN_CHAIN_COUNT: ${{ inputs.chain_count }}
+  IN_CHAIN_START: ${{ inputs.chain_start }}
   NDK_VERSION: 29.0.14206865
   MAX_CHAIN: 4
-  # make budget measured from job start: 6 h limit minus >= 30 min for cache save / re-dispatch
+  # make budget measured from job start: 6 h limit minus >= 25 min for cache save / re-dispatch
   MAKE_DEADLINE_MIN: 325
-  GH_TOKEN: ${{ github.token }}
+  # if make finishes with less than this left, resume in a fresh run so the app/gradle stage gets a full budget
+  MIN_LEFT_FOR_APP_MIN: 90
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Job start time and chain guard
+      - name: Job start time, input validation and chain guard
         run: |
-          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
-          echo "CHAIN_START=${{ inputs.chain_start }}" >> "$GITHUB_ENV"
-          if [ -z "${{ inputs.chain_start }}" ]; then echo "CHAIN_START=$(date +%s)" >> "$GITHUB_ENV"; fi
-          if [ "$CHAIN_COUNT" -ge "$MAX_CHAIN" ]; then
-            echo "::error::chain_count=$CHAIN_COUNT reached the maximum of $MAX_CHAIN runs"; exit 1
+          for v in "${IN_CHAIN_COUNT:-0}" "${IN_CHAIN_START:-0}"; do
+            case "$v" in ''|*[!0-9]*) echo "::error::non-numeric input"; exit 1 ;; esac
+          done
+          chain_count=${IN_CHAIN_COUNT:-0}
+          chain_start=${IN_CHAIN_START:-$(date +%s)}
+          { echo "JOB_START=$(date +%s)"; echo "CHAIN_COUNT=$chain_count"; echo "CHAIN_START=$chain_start"; } >> "$GITHUB_ENV"
+          if [ "$chain_count" -ge "$MAX_CHAIN" ]; then
+            echo "::error::chain_count=$chain_count reached the maximum of $MAX_CHAIN runs"; exit 1
           fi
 
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Read upstream.lock
         run: |
@@ -148,6 +155,7 @@ jobs:
           case "$ABI" in
             arm64-v8a) DISTRO=CPAndroidAarch64 ;;
             x86_64)    DISTRO=CPAndroidX86_64 ;;
+            *) echo "::error::unknown ABI $ABI"; exit 1 ;;
           esac
           # release only: no --enable-dbgutil / --enable-debug / --enable-sal-log. Same flags for both ABIs.
           # (--disable-branding is a top-level configure option, not an engine one.)
@@ -160,18 +168,46 @@ jobs:
           cat autogen.input
           ./autogen.sh
 
+      - name: Cross-build diagnostics (after configure)
+        working-directory: online/engine
+        run: |
+          grep -E '^export (CROSS_COMPILING|WORKDIR|WORKDIR_FOR_BUILD|BUILDDIR_FOR_BUILD|INSTDIR_FOR_BUILD|BUILDDIR|OS|OS_FOR_BUILD)=' config_host.mk || true
+          grep -E '^(WORKDIR|INSTDIR)' config_build.mk || true
+          ls -d workdir* instdir* CONF-FOR-BUILD 2>&1 || true
+
       - name: Build engine (time-boxed)
         id: make
         working-directory: online/engine
         run: |
           budget=$(( JOB_START + MAKE_DEADLINE_MIN*60 - $(date +%s) ))
           echo "make budget: $budget s"
-          set +e
-          timeout -s INT "$budget" make -j"$(nproc)" 2>&1 | tee "$RUNNER_TEMP/make.log"
-          rc=${PIPESTATUS[0]}
-          set -e
+          if [ "$budget" -le 0 ]; then
+            rc=124
+          else
+            set +e
+            timeout -k 10m -s INT "$budget" make -j"$(nproc)" 2>&1 | tee "$RUNNER_TEMP/make.log"
+            rc=${PIPESTATUS[0]}
+            set -e
+          fi
           echo "make rc=$rc"
+          left=$(( JOB_START + 360*60 - $(date +%s) ))
+          if [ "$rc" = 0 ] && [ "$left" -lt $(( MIN_LEFT_FOR_APP_MIN*60 )) ]; then
+            echo "make finished but only $((left/60)) min left; resuming in a fresh run for the app stage"
+            status=resume
+          elif [ "$rc" = 0 ]; then status=done
+          elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then status=resume
+          else status=fail; fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Diagnostics on make failure
+        if: always() && steps.make.outputs.status == 'fail'
+        working-directory: online/engine
+        run: |
+          grep -E '^export (CROSS_COMPILING|WORKDIR|WORKDIR_FOR_BUILD|BUILDDIR_FOR_BUILD|INSTDIR_FOR_BUILD)=' config_host.mk || true
+          ls -la workdir_for_build/LinkTarget/Executable 2>&1 | head -40 || true
+          ls -la workdir/LinkTarget/Executable 2>&1 | head -20 || true
+          tail -n 120 "$RUNNER_TEMP/make.log"
 
       - name: ccache stats
         if: always()
@@ -194,9 +230,11 @@ jobs:
 
       - name: Delete superseded ccache entries
         if: always() && steps.save.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cur="ccache-$ABI-$UP_COMMIT-${{ github.run_id }}"
-          keys=$(gh cache list --key "ccache-$ABI-$UP_COMMIT-" --limit 100 --json id,key --jq '.[]|"\(.id) \(.key)"')
+          keys=$(gh cache list --ref "$GITHUB_REF" --key "ccache-$ABI-$UP_COMMIT-" --limit 100 --json id,key --jq '.[]|"\(.id) \(.key)"')
           echo "$keys"
           if echo "$keys" | grep -q " $cur\$"; then
             echo "$keys" | awk -v c="$cur" '$2!=c{print $1}' | while read -r id; do gh cache delete "$id" || true; done
@@ -204,8 +242,11 @@ jobs:
 
       - name: Chain summary and re-dispatch
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAKE_RC: ${{ steps.make.outputs.rc }}
+          MAKE_STATUS: ${{ steps.make.outputs.status }}
         run: |
-          rc="${{ steps.make.outputs.rc }}"
           now=$(date +%s)
           {
             echo "## office-android $ABI"
@@ -213,52 +254,63 @@ jobs:
             echo "- run in chain: $((CHAIN_COUNT+1)) of max $MAX_CHAIN"
             echo "- this run wall-clock: $(( (now-JOB_START)/60 )) min"
             echo "- chain wall-clock so far: $(( (now-CHAIN_START)/60 )) min"
-            echo "- make exit code: ${rc:-n/a} (124 = time budget hit)"
+            echo "- make exit code: ${MAKE_RC:-n/a}, status: ${MAKE_STATUS:-n/a} (resume = time budget hit)"
             echo '```'; ccache -s; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$rc" = 124 ]; then
+          if [ "$MAKE_STATUS" = resume ]; then
             next=$((CHAIN_COUNT+1))
             if [ "$next" -ge "$MAX_CHAIN" ]; then
-              echo "::error::engine make still unfinished after $MAX_CHAIN runs; chain guard hit"; exit 1
+              echo "::error::engine/app build still unfinished after $MAX_CHAIN runs; chain guard hit"; exit 1
             fi
-            gh workflow run office-android.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.ref_name }}" \
+            gh workflow run office-android.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
               -f abi="$ABI" -f chain_count="$next" -f chain_start="$CHAIN_START"
             echo "- re-dispatched as chain_count=$next" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Fail if make failed for a real reason
-        if: steps.make.outputs.rc != '0' && steps.make.outputs.rc != '124'
-        run: echo "::error::engine make failed (rc=${{ steps.make.outputs.rc }})"; tail -n 200 "$RUNNER_TEMP/make.log"; exit 1
+        if: steps.make.outputs.status == 'fail'
+        run: echo "::error::engine make failed (rc=${{ steps.make.outputs.rc }})"; exit 1
 
       # ---- everything below only runs when the engine make finished ----
       - name: Configure Android app (top level)
-        if: steps.make.outputs.rc == '0'
+        if: steps.make.outputs.status == 'done'
         working-directory: online
         run: |
           ./autogen.sh
           ./configure --enable-androidapp --disable-branding
 
       - name: Build browser assets and app glue (top level make)
-        if: steps.make.outputs.rc == '0'
+        if: steps.make.outputs.status == 'done'
         working-directory: online
         run: make -j"$(nproc)"
 
       - name: Gradle build AAR (browser assets are built by the generate*Assets tasks)
-        if: steps.make.outputs.rc == '0'
+        if: steps.make.outputs.status == 'done'
         working-directory: online/android
         run: |
           if [ "$ABI" = x86_64 ]; then task=:lib:assembleDebug; else task=:lib:assembleRelease; fi
           ./gradlew --no-daemon "$task"
 
-      - name: Collect and checksum AAR
-        if: steps.make.outputs.rc == '0'
+      - name: Collect, licence and checksum AAR
+        if: steps.make.outputs.status == 'done'
         run: |
+          variant=release; [ "$ABI" = x86_64 ] && variant=debug
+          aar=$(ls online/android/build/lib/outputs/aar/lib-$variant.aar online/android/lib/build/outputs/aar/lib-$variant.aar 2>/dev/null | head -1)
+          [ -n "$aar" ] || { echo "::error::lib-$variant.aar not found"; find online/android -name '*.aar'; exit 1; }
           mkdir -p out && cd out
-          aar=$(find "$GITHUB_WORKSPACE/online" -name '*.aar' -path '*outputs/aar*' | head -1)
-          [ -n "$aar" ] || { echo "::error::no AAR produced"; exit 1; }
-          cp "$aar" "quiredocs-office-android-$ABI.aar"
+          cp "$GITHUB_WORKSPACE/$aar" "quiredocs-office-android-$ABI.aar"
           cp "$GITHUB_WORKSPACE/upstream.lock" .
-          sha256sum ./* > SHA256SUMS
+          mkdir licences
+          cp "$GITHUB_WORKSPACE"/online/CODA-THIRDPARTYLICENSES.html "$GITHUB_WORKSPACE"/online/THIRDPARTYLICENSES \
+             "$GITHUB_WORKSPACE"/online/engine/COPYING.MPL licences/
+          cat > licences.json <<EOT
+          [
+            {"name": "Collabora Online monorepo (online + engine)", "commit": "$UP_COMMIT", "licence": "MPL-2.0", "files": ["licences/COPYING.MPL"]},
+            {"name": "Third-party components", "licence": "various, see files", "files": ["licences/CODA-THIRDPARTYLICENSES.html", "licences/THIRDPARTYLICENSES"]}
+          ]
+          EOT
+          python3 -m json.tool licences.json >/dev/null
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
           so_size=$(unzip -lv "quiredocs-office-android-$ABI.aar" | awk '/liblo-native-code.so/{print $1" bytes uncompressed, "$3" compressed"}')
           {
             echo "### AAR ($ABI)"
@@ -267,9 +319,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload AAR
-        if: steps.make.outputs.rc == '0'
+        if: steps.make.outputs.status == 'done'
         uses: actions/upload-artifact@v4
         with:
           name: quiredocs-office-android-${{ env.ABI }}
-          path: out/*
+          path: out/
           if-no-files-found: error

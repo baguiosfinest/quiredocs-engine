@@ -36,4 +36,7 @@ cmake --build "$work/qpdf-b" --target libqpdf
 mkdir -p "$stage/lib" "$stage/include/qpdf"
 cp "$work/qpdf-b/libqpdf/libqpdf.a" "$deps/lib/libjpeg.a" "$stage/lib/"
 cp "$work"/qpdf/include/qpdf/*.h "$work"/qpdf/include/qpdf/*.hh "$work/qpdf-b/libqpdf/qpdf/qpdf-config.h" "$stage/include/qpdf/"
+mkdir -p "$stage/licenses/qpdf" "$stage/licenses/libjpeg-turbo"
+cp "$work"/qpdf/LICENSE.txt "$work"/qpdf/NOTICE* "$stage/licenses/qpdf/"
+cp "$work"/jpeg/LICENSE.md "$work"/jpeg/README.ijg "$stage/licenses/libjpeg-turbo/"
 rm -rf "$work"
