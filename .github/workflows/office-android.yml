@@ -313,6 +313,12 @@ jobs:
           ]
           EOT
           python3 -m json.tool licences.json >/dev/null
+          # Release config only (M0 amendment 6): NSPR embeds "(debug)" in its version string when built without BUILD_OPT.
+          unzip -l "quiredocs-office-android-$ABI.aar" "jni/$ABI/libnspr4.so" >/dev/null || { echo "::error::libnspr4.so missing from AAR"; exit 1; }
+          nspr_strings=$(unzip -p "quiredocs-office-android-$ABI.aar" "jni/$ABI/libnspr4.so" | strings)
+          if grep -q 'NSPR .*(debug)' <<<"$nspr_strings"; then
+            echo "::error::libnspr4.so is a debug build"; exit 1
+          fi
           find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
           so_size=$(unzip -lv "quiredocs-office-android-$ABI.aar" | awk '/liblo-native-code.so/{print $1" bytes uncompressed, "$3" compressed"}')
           {
