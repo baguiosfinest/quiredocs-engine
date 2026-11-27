@@ -1,7 +1,10 @@
 name: pdf
 
 on:
+  # TEMPORARY branch push (remove before merge)
   push:
+    branches: [m0/ci]
+    paths: ['.github/workflows/pdf.yml']
     tags: ['engine-v*']
   workflow_dispatch:
 

@@ -34,6 +34,9 @@ env:
   IN_CHAIN_COUNT: ${{ inputs.chain_count }}
   IN_CHAIN_START: ${{ inputs.chain_start }}
   NDK_VERSION: 29.0.14206865
+  # dash (Ubuntu /bin/sh) ignores the arguments of `. script args`, which breaks engine configure's
+  # BUILD-side config hand-over (WORKDIR_FOR_BUILD == WORKDIR, OS_FOR_BUILD empty). Force bash.
+  CONFIG_SHELL: /bin/bash
   MAX_CHAIN: 4
   # make budget measured from job start: 6 h limit minus >= 25 min for cache save / re-dispatch
   MAKE_DEADLINE_MIN: 325
