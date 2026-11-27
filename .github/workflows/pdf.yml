@@ -1,6 +1,10 @@
 name: pdf
 
 on:
+  # TEMPORARY (remove before merge): dispatch needs the file on main, so run from the PR branch on push
+  push:
+    branches: [m0/ci]
+    paths: ['.github/workflows/pdf.yml', 'scripts/build-qpdf.sh', 'pdf*.lock']
   workflow_dispatch:
 
 permissions:

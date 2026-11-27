@@ -1,6 +1,10 @@
 name: office-android
 
 on:
+  # TEMPORARY (remove before merge): dispatch needs the file on main, so run from the PR branch on push
+  push:
+    branches: [m0/ci]
+    paths: ['.github/workflows/office-android.yml']
   workflow_dispatch:
     inputs:
       abi:
@@ -22,12 +26,12 @@ permissions:
   actions: write
 
 concurrency:
-  group: office-android-${{ inputs.abi }}
+  group: office-android-${{ inputs.abi || 'arm64-v8a' }}
   cancel-in-progress: false
 
 env:
-  ABI: ${{ inputs.abi }}
-  CHAIN_COUNT: ${{ inputs.chain_count }}
+  ABI: ${{ inputs.abi || 'arm64-v8a' }}
+  CHAIN_COUNT: ${{ inputs.chain_count || '0' }}
   NDK_VERSION: 29.0.14206865
   MAX_CHAIN: 4
   # make budget measured from job start: 6 h limit minus >= 30 min for cache save / re-dispatch
@@ -119,8 +123,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ inputs.abi }}-${{ env.UP_COMMIT }}-${{ github.run_id }}
-          restore-keys: ccache-${{ inputs.abi }}-${{ env.UP_COMMIT }}-
+          key: ccache-${{ env.ABI }}-${{ env.UP_COMMIT }}-${{ github.run_id }}
+          restore-keys: ccache-${{ env.ABI }}-${{ env.UP_COMMIT }}-
 
       - name: Restore external tarballs
         id: extar
@@ -183,7 +187,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ inputs.abi }}-${{ env.UP_COMMIT }}-${{ github.run_id }}
+          key: ccache-${{ env.ABI }}-${{ env.UP_COMMIT }}-${{ github.run_id }}
 
       - name: Save external tarballs
         if: always() && steps.extar.outputs.cache-hit != 'true'
@@ -270,6 +274,6 @@ jobs:
         if: steps.make.outputs.rc == '0'
         uses: actions/upload-artifact@v4
         with:
-          name: quiredocs-office-android-${{ inputs.abi }}
+          name: quiredocs-office-android-${{ env.ABI }}
           path: out/*
           if-no-files-found: error
